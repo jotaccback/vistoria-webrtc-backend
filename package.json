@@ -1,0 +1,12 @@
+{
+  "name": "vistoria-websocket-server",
+  "version": "1.0.0",
+  "main": "websocket-server.js",
+  "scripts": {
+    "start": "node websocket-server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.13.0"
+  }
+}
