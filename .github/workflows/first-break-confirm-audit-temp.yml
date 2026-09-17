@@ -1,0 +1,152 @@
+name: Temporary first-break confirmation audit
+
+on:
+  push:
+    paths:
+      - '.github/workflows/first-break-confirm-audit-temp.yml'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute first break plus immediate hold
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, io, urllib.request
+          from collections import defaultdict
+
+          URLS = {
+              'ATP': [
+                  'https://raw.githubusercontent.com/ppaulojr/tennis_pointbypoint/master/pbp_matches_atp_main_archive.csv',
+                  'https://raw.githubusercontent.com/ppaulojr/tennis_pointbypoint/master/pbp_matches_atp_main_current.csv',
+              ],
+              'WTA': [
+                  'https://raw.githubusercontent.com/ppaulojr/tennis_pointbypoint/master/pbp_matches_wta_main_archive.csv',
+                  'https://raw.githubusercontent.com/ppaulojr/tennis_pointbypoint/master/pbp_matches_wta_main_current.csv',
+              ],
+          }
+
+          def point_winner(ch):
+              if ch in ('S','A'): return 'S'
+              if ch in ('R','D'): return 'R'
+              return None
+
+          def game_winner(g):
+              if not g or '/' in g:
+                  return None
+              pts=[point_winner(ch) for ch in g]
+              pts=[p for p in pts if p]
+              if len(pts)<4:
+                  return None
+              s=r=0
+              for p in pts:
+                  if p=='S': s+=1
+                  else: r+=1
+                  if max(s,r)>=4 and abs(s-r)>=2:
+                      return 'S' if s>r else 'R'
+              return None
+
+          stats=defaultdict(lambda: defaultdict(int))
+          seen=set()
+
+          for tour, urls in URLS.items():
+              for url in urls:
+                  data=urllib.request.urlopen(url, timeout=120).read().decode('utf-8-sig', errors='replace')
+                  for row in csv.DictReader(io.StringIO(data)):
+                      if '/' in (row.get('server1') or '') or '/' in (row.get('server2') or ''):
+                          continue
+                      key=(tour,row.get('date'),row.get('tny_name'),row.get('server1'),row.get('server2'),row.get('winner'),row.get('score'),row.get('pbp'))
+                      if key in seen: continue
+                      seen.add(key)
+                      pbp=(row.get('pbp') or '').strip()
+                      if not pbp: continue
+                      try: match_winner=int(row.get('winner') or 0)
+                      except: match_winner=0
+                      if match_winner not in (1,2): continue
+                      stats[tour]['rows'] += 1
+
+                      # Flatten PBP while preserving every game in match order.
+                      raw_games=[]
+                      for st in pbp.split('.'):
+                          for g in st.split(';'):
+                              g=g.strip()
+                              if g: raw_games.append(g)
+
+                      server=1
+                      first_breaker=None
+                      confirm=None
+                      bad=False
+                      i=0
+                      while i < len(raw_games):
+                          g=raw_games[i]
+                          if '/' in g:
+                              # Tiebreak is not a break; service order for the next regular game flips.
+                              server=2 if server==1 else 1
+                              i+=1
+                              continue
+                          gw=game_winner(g)
+                          if gw is None:
+                              bad=True
+                              break
+                          if first_breaker is None:
+                              if gw=='R':
+                                  first_breaker=2 if server==1 else 1
+                                  # Next regular game should be the breaker's service game.
+                                  server=2 if server==1 else 1
+                                  j=i+1
+                                  while j < len(raw_games) and '/' in raw_games[j]:
+                                      # Defensive only; this should essentially never follow a normal break.
+                                      server=2 if server==1 else 1
+                                      j+=1
+                                  if j >= len(raw_games):
+                                      confirm='NO_NEXT_GAME'
+                                      break
+                                  ngw=game_winner(raw_games[j])
+                                  if ngw is None:
+                                      bad=True
+                                      break
+                                  # Audit service identity; after a normal break, next server should equal breaker.
+                                  if server != first_breaker:
+                                      stats[tour]['server_mismatch'] += 1
+                                  confirm = 'HOLD' if ngw=='S' else 'REBREAK'
+                                  break
+                              else:
+                                  server=2 if server==1 else 1
+                          i+=1
+
+                      if bad:
+                          stats[tour]['invalid'] += 1
+                          continue
+                      if first_breaker is None:
+                          stats[tour]['no_break'] += 1
+                          continue
+                      if confirm == 'NO_NEXT_GAME':
+                          stats[tour]['no_next_game'] += 1
+                          continue
+
+                      stats[tour]['with_first_break_and_next'] += 1
+                      if first_breaker == match_winner:
+                          stats[tour]['first_break_win'] += 1
+                      else:
+                          stats[tour]['first_break_loss'] += 1
+
+                      if confirm=='HOLD':
+                          stats[tour]['confirmed'] += 1
+                          if first_breaker==match_winner: stats[tour]['confirmed_win'] += 1
+                          else: stats[tour]['confirmed_loss'] += 1
+                      elif confirm=='REBREAK':
+                          stats[tour]['rebreak'] += 1
+                          if first_breaker==match_winner: stats[tour]['rebreak_firstbreaker_win'] += 1
+                          else: stats[tour]['rebreak_firstbreaker_loss'] += 1
+
+          print('=== FIRST BREAK + IMMEDIATE NEXT SERVICE GAME ===')
+          total=defaultdict(int)
+          for tour in ('ATP','WTA'):
+              s=stats[tour]
+              for k,v in s.items(): total[k]+=v
+              c=s['confirmed']; r=s['rebreak']; base=s['with_first_break_and_next']
+              print(f"{tour}: rows={s['rows']} base={base} confirmed={c} confirmed_win={s['confirmed_win']} confirmed_loss={s['confirmed_loss']} confirmed_match_win_rate={(100*s['confirmed_win']/c if c else float('nan')):.4f}% confirmed_share={(100*c/base if base else float('nan')):.4f}% rebreak={r} rebreak_firstbreaker_win={s['rebreak_firstbreaker_win']} rebreak_firstbreaker_loss={s['rebreak_firstbreaker_loss']} rebreak_firstbreaker_match_win_rate={(100*s['rebreak_firstbreaker_win']/r if r else float('nan')):.4f}% first_break_baseline={(100*s['first_break_win']/base if base else float('nan')):.4f}% no_break={s['no_break']} no_next_game={s['no_next_game']} invalid={s['invalid']} server_mismatch={s['server_mismatch']}")
+          s=total; c=s['confirmed']; r=s['rebreak']; base=s['with_first_break_and_next']
+          print(f"COMBINED: rows={s['rows']} base={base} confirmed={c} confirmed_win={s['confirmed_win']} confirmed_loss={s['confirmed_loss']} confirmed_match_win_rate={(100*s['confirmed_win']/c if c else float('nan')):.4f}% confirmed_share={(100*c/base if base else float('nan')):.4f}% rebreak={r} rebreak_firstbreaker_win={s['rebreak_firstbreaker_win']} rebreak_firstbreaker_loss={s['rebreak_firstbreaker_loss']} rebreak_firstbreaker_match_win_rate={(100*s['rebreak_firstbreaker_win']/r if r else float('nan')):.4f}% first_break_baseline={(100*s['first_break_win']/base if base else float('nan')):.4f}% no_break={s['no_break']} no_next_game={s['no_next_game']} invalid={s['invalid']} server_mismatch={s['server_mismatch']}")
+          PY
